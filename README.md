@@ -145,12 +145,64 @@ Python ≥ 3.9; only `numpy`, `scipy`, `matplotlib` (plus `pytest` for tests).
 
 ```
 physim/__init__.py     # the whole engine (Network, Component, all components)
-tests/test_physim.py   # acceptance tests
-physim_demo.ipynb      # runnable demos with plots
+tests/test_physim.py   # Milestone 1 acceptance tests (regression gate)
+tests/test_truck.py    # Milestone 3 acceptance tests T8-T13 (6x6 diesel truck)
+physim_demo.ipynb      # runnable M1 demos with plots
+truck_demo.py          # generates truck_demo.png (4-panel truck validation figure)
+truck_demo.png
 README.md
 ```
 
+## Milestone 3 — 6×6 diesel utility truck (20 t GVW, CVT stage)
+
+New components (each docstring in `physim/__init__.py` states its law, units,
+calibration, and failure modes — *no model goes in without its why*):
+
+| Component | Ports | Law | Why it is modeled this way |
+|---|---|---|---|
+| `QuadraticDamper(a, b, c)` | 2 translational | `F = c·v·|v|` | `v²` alone would push the truck *forward* while rolling backwards (energy pump); `v·|v|` keeps quadratic magnitude with the right sign and is smooth at v=0 so Newton doesn't chatter at rest. `c = ½ρCdA` = 3.65 for the 2.65×2.5 m box, Cd≈0.9 |
+| `RoadForce(node, m, grade_fn, Crr)` | 1 translational | `F = −m·g·sin(atan(grade)) − Crr·m·g·cos(atan(grade))·tanh(v/0.3)` | grades are in percent (0.6 = 60% → θ=atan(0.6)=31°), not force fractions; `cos θ` shrinks the normal load that traction/rolling scale with; `tanh` regularizes Coulomb rolling resistance at standstill (same trick as Simscape tire blocks) so the truck can leave rest |
+| `DieselEngine(node, T_full, w_idle, J, throttle_key, ...)` | 1 rotational | `τ = th·T_full(ω) − (1−th)·c_brake·ω` minus trapezoidal crank inertia | a diesel is torque-controlled: throttle sets fueling → torque up to the WOT curve `T_full` (rpm table, interp in rad/s, right end = 0 past the governor); closed-throttle pumping loss ∝ ω; fuel via BSFC island `195 + 260(1−load)² g/kWh` with a 0.6 kg/h idle floor, accumulated in kg, observed in L via 0.832 kg/L |
+| `VariableGear(a1,a2,b1,b2, ratio_fn, rho_min, rho_max)` | 4 rotational | `ω_in = ρ·ω_out`, `τ_out = ρ·τ_in` (power-conserving), internal unknown `τ_in` | the CVT as a rigid kinematic constraint; `ρ = clip(ratio_fn(t,ctx), 5, 50)` is a control input. Pitfall: `ρ` must be recomputed through one shared `_rho()` helper in **both** `flows()` and `constraints()`, or the Newton solve converges to a state violating the constraint |
+| `SlipWheel(x, r1, r2, radius, Fmax_fn, k_slip)` | 1 translational + 2 rotational | `F = Fmax·tanh(k_slip·(rω−v)/Fmax)` | the two-regime tire curve: steep-linear at small slip (≈ ideal rolling, v=rω), saturating at μN (no wheelspin buys more than μN → low-μ accel pins at μg). Slip power `F·(rω−v)` is dissipated as tire heat, observed as `P_slip_loss` |
+| `ContextPublisher(key, val_fn)` | none | publishes `val_fn(t,ctx)` into `ctx[key]` | the Simscape PS-Signal equivalent; no terminals, cannot perturb the solve |
+
+Also from Milestone 2 (in the engine, regression-tested): translational domain
+(`v`, `F`), `TransMass`, `TransDamper`, `TransSpring`, `ForceSource`,
+`SpeedSource`, `Sensor`, `Gear`, `Wheel`, `CurrentSource`, `Battery`,
+`ControlledTorqueSource`, `PIController`, `DCTransformer`. Engine fixes: `run()`
+no longer re-commits states after the final sample (`commit_states=(i < n)`), and
+springs integrate with the same implicit trapezoidal law as everything else.
+
+**Truck wiring** (`tests/test_truck.py::build_truck`): PI speed controller on
+`value::vsens` → throttle `u::pi` → `DieselEngine` on `eng` → `VariableGear`
+`eng→sh` with the CVT schedule `ρ = 160·R_WHEEL/max(v, 0.05)` (hold the engine at
+~160 rad/s ≈ peak torque; ρ=50 = launch, ρ=5 = overdrive, which is what makes top
+speed power-limited) → `SlipWheel` `sh→veh` with `Fmax = μ·M·g·cos θ` → `TransMass`
+20 t on `veh`, against `QuadraticDamper` (aero) and `RoadForce` (grade+rolling).
+
+**Validation** (`python -m pytest tests/ -v`, and `python truck_demo.py` for the
+4-panel figure `truck_demo.png`):
+
+| Test | Proves | Reference (band) |
+|---|---|---|
+| T8 engine dyno | engine plant settles exactly on its WOT curve under a load damper | 1474.0 Nm @ 1877 rpm (±5 Nm), 394 hp (240–300 kW), 66.7 L/h (45–85) |
+| T9 top speed | 105–110 km/h spec, power- not grip-limited | 104.4 km/h (104–111), slip 0.009 m/s (< 0.15) |
+| T10 60% grade | hardest spec item: 31° slope, ~104 kN gravity | crawl 8.4 km/h (1.2–4.2 m/s), wheel 104.3 vs 104.3 kN req'd (8%), slip 0.278 (< 0.3) |
+| T11 low-μ launch | traction limit actually limits | max accel 4.21 ≤ 1.05·μg = 4.41 m/s², \|F\|/Fmax = 1.00 (> 0.7), slip 0.62 m/s (> 0.2) |
+| T12 cruise range | fuel chain throttle→BSFC→kg→L | 843 km @ 38.0 L/100 km on 320 L (band 830–950 vs 890 spec) |
+| T13 0–60 km/h | report-only sanity | 13.3 s (5–25 s) |
+
+**CVT-stage assumptions & known limitations (documented, not hidden):** the ideal
+CVT is rigid — it changes ratio instantly and conserves power, so it cannot
+multiply torque at zero wheel speed. A *standing* launch on a 60% grade is
+therefore unphysical at this stage (T10 approaches the grade with speed and
+settles into a steady crawl); solving it needs the torque converter scheduled
+with the 6-speed milestone. All axles are lumped into one aggregate driven axle
+(`Fmax = μ·M·g·cos θ`) — no weight transfer, no per-axle 6×6 torque bias. The
+model is 1-D longitudinal only: no trench/step crossing, side slopes, or steering.
+
 ## Possible extensions (not implemented, by design)
 
-Translational domain (`v`, `F`), hydraulic domain (pressure, flow), battery OCV+R model,
-gearbox, adaptive step size.
+Hydraulic domain (pressure, flow), torque converter + 6-speed gearbox with shift
+schedule, per-axle driveline with weight transfer, adaptive step size.
